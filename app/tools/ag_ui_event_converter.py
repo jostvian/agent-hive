@@ -9,7 +9,14 @@ from ag_ui.core.events import (
     ToolCallArgsEvent,
     ToolCallEndEvent,
 )
-from openai.types.responses import ResponseStreamEvent
+from openai.types.responses import (
+    ResponseStreamEvent,
+    ResponseOutputItemAddedEvent,
+    ResponseTextDeltaEvent,
+    ResponseTextDoneEvent,
+    ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseFunctionCallArgumentsDoneEvent,
+)
 
 class AGUIEventConverter:
     """
@@ -26,24 +33,29 @@ class AGUIEventConverter:
         """
         events: List[BaseEvent] = []
 
-        if event.type == "response.output_item.added":
-            self._process_output_item_added(event, events)
+        match event:
+            case ResponseOutputItemAddedEvent():
+                self._process_output_item_added(event, events)
 
-        elif event.type == "response.output_text.delta":
-            self._process_text_delta(event, events)
+            case ResponseTextDeltaEvent():
+                self._process_text_delta(event, events)
 
-        elif event.type == "response.output_text.done":
-            self._process_text_done(event, events)
+            case ResponseTextDoneEvent():
+                self._process_text_done(event, events)
 
-        elif event.type == "response.function_call_arguments.delta":
-            self._process_function_call_delta(event, events)
+            case ResponseFunctionCallArgumentsDeltaEvent():
+                self._process_function_call_delta(event, events)
 
-        elif event.type == "response.function_call_arguments.done":
-            self._process_function_call_done(event, events)
+            case ResponseFunctionCallArgumentsDoneEvent():
+                self._process_function_call_done(event, events)
+
+            case _:
+                # Ignore other events
+                pass
 
         return events
 
-    def _process_output_item_added(self, event: Any, events: List[BaseEvent]):
+    def _process_output_item_added(self, event: ResponseOutputItemAddedEvent, events: List[BaseEvent]):
         """Handles new output items (messages or tool calls)."""
         item = event.item
 
@@ -72,7 +84,7 @@ class AGUIEventConverter:
                 parent_message_id=None # Optional in AG_UI
             ))
 
-    def _process_text_delta(self, event: Any, events: List[BaseEvent]):
+    def _process_text_delta(self, event: ResponseTextDeltaEvent, events: List[BaseEvent]):
         """Handles text content updates."""
         events.append(TextMessageContentEvent(
             type=EventType.TEXT_MESSAGE_CONTENT,
@@ -80,14 +92,14 @@ class AGUIEventConverter:
             delta=event.delta
         ))
 
-    def _process_text_done(self, event: Any, events: List[BaseEvent]):
+    def _process_text_done(self, event: ResponseTextDoneEvent, events: List[BaseEvent]):
         """Handles end of text message."""
         events.append(TextMessageEndEvent(
             type=EventType.TEXT_MESSAGE_END,
             message_id=event.item_id
         ))
 
-    def _process_function_call_delta(self, event: Any, events: List[BaseEvent]):
+    def _process_function_call_delta(self, event: ResponseFunctionCallArgumentsDeltaEvent, events: List[BaseEvent]):
         """Handles tool call argument updates."""
         tool_call_id = self.item_id_to_tool_call_id.get(event.item_id)
         if tool_call_id:
@@ -97,7 +109,7 @@ class AGUIEventConverter:
                 delta=event.delta
             ))
 
-    def _process_function_call_done(self, event: Any, events: List[BaseEvent]):
+    def _process_function_call_done(self, event: ResponseFunctionCallArgumentsDoneEvent, events: List[BaseEvent]):
         """Handles end of tool call."""
         tool_call_id = self.item_id_to_tool_call_id.get(event.item_id)
         if tool_call_id:
