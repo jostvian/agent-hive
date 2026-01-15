@@ -9,115 +9,101 @@ from ag_ui.core.events import (
     ToolCallArgsEvent,
     ToolCallEndEvent,
 )
-from openai.types.chat import ChatCompletionChunk
+from openai.types.responses import ResponseStreamEvent
 
 class AGUIEventConverter:
     """
-    A generic converter to transform OpenAI streaming events (ChatCompletionChunk)
+    A generic converter to transform OpenAI Responses API streaming events (ResponseStreamEvent)
     into AG_UI events.
     """
     def __init__(self):
-        self.started_message_ids: Set[str] = set()
-        self.active_tool_calls: Dict[int, str] = {} # index -> tool_call_id
+        # Maps item_id (from OpenAI) to tool_call_id (for AG_UI/OpenAI correlation)
+        self.item_id_to_tool_call_id: Dict[str, str] = {}
 
-    def convert_event(self, chunk: ChatCompletionChunk) -> List[BaseEvent]:
+    def convert_event(self, event: ResponseStreamEvent) -> List[BaseEvent]:
         """
-        Converts an OpenAI ChatCompletionChunk into a list of AG_UI BaseEvents.
+        Converts an OpenAI ResponseStreamEvent into a list of AG_UI BaseEvents.
         """
         events: List[BaseEvent] = []
 
-        if not chunk.choices:
-            return events
+        if event.type == "response.output_item.added":
+            self._process_output_item_added(event, events)
 
-        choice = chunk.choices[0]
-        delta = choice.delta
-        message_id = chunk.id
+        elif event.type == "response.output_text.delta":
+            self._process_text_delta(event, events)
 
-        # Dispatch to handlers
-        self._process_text_content(delta, message_id, events)
-        self._process_tool_calls(delta, message_id, events)
-        self._process_finish_reason(choice, message_id, events)
+        elif event.type == "response.output_text.done":
+            self._process_text_done(event, events)
+
+        elif event.type == "response.function_call_arguments.delta":
+            self._process_function_call_delta(event, events)
+
+        elif event.type == "response.function_call_arguments.done":
+            self._process_function_call_done(event, events)
 
         return events
 
-    def _process_text_content(self, delta: Any, message_id: str, events: List[BaseEvent]):
-        """Handles text content updates."""
-        if delta.content is not None and delta.content != "":
-            # Start message if not already started
-            if message_id not in self.started_message_ids:
+    def _process_output_item_added(self, event: Any, events: List[BaseEvent]):
+        """Handles new output items (messages or tool calls)."""
+        item = event.item
+
+        if item.type == "message":
+            if item.role == "assistant":
+                # Start of a text message
                 events.append(TextMessageStartEvent(
                     type=EventType.TEXT_MESSAGE_START,
-                    message_id=message_id,
+                    message_id=item.id,
                     role="assistant"
                 ))
-                self.started_message_ids.add(message_id)
 
-            # Add content
-            events.append(TextMessageContentEvent(
-                type=EventType.TEXT_MESSAGE_CONTENT,
-                message_id=message_id,
-                delta=delta.content
+        elif item.type == "function_call":
+            # Start of a function/tool call
+            # item.id is the item ID (used in deltas), item.call_id is the tool call ID
+            tool_call_id = item.call_id
+
+            # Store mapping for future deltas
+            if item.id:
+                self.item_id_to_tool_call_id[item.id] = tool_call_id
+
+            events.append(ToolCallStartEvent(
+                type=EventType.TOOL_CALL_START,
+                tool_call_id=tool_call_id,
+                tool_call_name=item.name,
+                parent_message_id=None # Optional in AG_UI
             ))
 
-    def _process_tool_calls(self, delta: Any, message_id: str, events: List[BaseEvent]):
-        """Handles tool call updates."""
-        if delta.tool_calls:
-            for tool_call in delta.tool_calls:
-                index = tool_call.index
+    def _process_text_delta(self, event: Any, events: List[BaseEvent]):
+        """Handles text content updates."""
+        events.append(TextMessageContentEvent(
+            type=EventType.TEXT_MESSAGE_CONTENT,
+            message_id=event.item_id,
+            delta=event.delta
+        ))
 
-                # If we have an ID, it's the start of a new tool call
-                if tool_call.id:
-                    # In OpenAI stream, only the first chunk of a tool call has the ID and name
-                    tool_call_id = tool_call.id
-                    name = tool_call.function.name if tool_call.function and tool_call.function.name else "unknown_tool"
+    def _process_text_done(self, event: Any, events: List[BaseEvent]):
+        """Handles end of text message."""
+        events.append(TextMessageEndEvent(
+            type=EventType.TEXT_MESSAGE_END,
+            message_id=event.item_id
+        ))
 
-                    self.active_tool_calls[index] = tool_call_id
+    def _process_function_call_delta(self, event: Any, events: List[BaseEvent]):
+        """Handles tool call argument updates."""
+        tool_call_id = self.item_id_to_tool_call_id.get(event.item_id)
+        if tool_call_id:
+            events.append(ToolCallArgsEvent(
+                type=EventType.TOOL_CALL_ARGS,
+                tool_call_id=tool_call_id,
+                delta=event.delta
+            ))
 
-                    events.append(ToolCallStartEvent(
-                        type=EventType.TOOL_CALL_START,
-                        tool_call_id=tool_call_id,
-                        tool_call_name=name,
-                        parent_message_id=message_id # Linking tool call to the completion message ID
-                    ))
-
-                # If we have arguments, it's a content update for the tool call
-                if tool_call.function and tool_call.function.arguments:
-                    tool_call_id = self.active_tool_calls.get(index)
-                    if tool_call_id:
-                        events.append(ToolCallArgsEvent(
-                            type=EventType.TOOL_CALL_ARGS,
-                            tool_call_id=tool_call_id,
-                            delta=tool_call.function.arguments
-                        ))
-
-    def _process_finish_reason(self, choice: Any, message_id: str, events: List[BaseEvent]):
-        """Handles finish reasons."""
-        if choice.finish_reason:
-            if choice.finish_reason == "stop":
-                # If we were streaming text, end it
-                if message_id in self.started_message_ids:
-                    events.append(TextMessageEndEvent(
-                        type=EventType.TEXT_MESSAGE_END,
-                        message_id=message_id
-                    ))
-                    # Cleanup
-                    self.started_message_ids.discard(message_id)
-
-            elif choice.finish_reason == "tool_calls":
-                # End all active tool calls
-                for index, tool_call_id in list(self.active_tool_calls.items()):
-                    events.append(ToolCallEndEvent(
-                        type=EventType.TOOL_CALL_END,
-                        tool_call_id=tool_call_id
-                    ))
-                self.active_tool_calls.clear()
-
-            # Note: There might be other finish reasons like "length" or "content_filter"
-            # which we might want to map to an error or just end the message.
-            # For now, we treat them as ending the message if it was started.
-            elif message_id in self.started_message_ids:
-                 events.append(TextMessageEndEvent(
-                        type=EventType.TEXT_MESSAGE_END,
-                        message_id=message_id
-                    ))
-                 self.started_message_ids.discard(message_id)
+    def _process_function_call_done(self, event: Any, events: List[BaseEvent]):
+        """Handles end of tool call."""
+        tool_call_id = self.item_id_to_tool_call_id.get(event.item_id)
+        if tool_call_id:
+            events.append(ToolCallEndEvent(
+                type=EventType.TOOL_CALL_END,
+                tool_call_id=tool_call_id
+            ))
+            # Optional: Clean up mapping if no longer needed
+            # del self.item_id_to_tool_call_id[event.item_id]

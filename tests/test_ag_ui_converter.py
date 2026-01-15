@@ -9,62 +9,72 @@ from ag_ui.core.events import (
     ToolCallArgsEvent,
     ToolCallEndEvent,
 )
-from openai.types.chat import ChatCompletionChunk
-from openai.types.chat.chat_completion_chunk import Choice, ChoiceDelta, ChoiceDeltaToolCall, ChoiceDeltaToolCallFunction
+# We need to mock the OpenAI events since constructing them might be verbose or require validation
+from openai.types.responses import (
+    ResponseOutputItemAddedEvent,
+    ResponseTextDeltaEvent,
+    ResponseTextDoneEvent,
+    ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseFunctionCallArgumentsDoneEvent,
+)
+from openai.types.responses.response_output_message import ResponseOutputMessage
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 
-def create_chunk(
-    delta_content: str = None,
-    delta_tool_calls: list = None,
-    finish_reason: str = None,
-    chunk_id: str = "msg_123"
-) -> ChatCompletionChunk:
-    delta_args = {}
-    if delta_content is not None:
-        delta_args["content"] = delta_content
-    if delta_tool_calls is not None:
-        delta_args["tool_calls"] = delta_tool_calls
-
-    delta = ChoiceDelta(**delta_args)
-
-    choice = Choice(
-        delta=delta,
-        finish_reason=finish_reason,
-        index=0
-    )
-
-    return ChatCompletionChunk(
-        id=chunk_id,
-        choices=[choice],
-        created=1234567890,
-        model="gpt-4",
-        object="chat.completion.chunk"
-    )
+# Mocking constructors or using simple objects since Pydantic models might require all fields
+# But since we have the libraries installed, we can try to use them if possible,
+# or use duck-typing/mock objects if constructors are too strict.
 
 def test_convert_text_message():
     converter = AGUIEventConverter()
 
-    # Chunk 1: Start and content "Hello"
-    chunk1 = create_chunk(delta_content="Hello")
-    events1 = converter.convert_event(chunk1)
+    # 1. Output Item Added (Message)
+    msg_item = ResponseOutputMessage(
+        id="msg_123",
+        type="message",
+        role="assistant",
+        content=[],
+        status="in_progress"
+    )
+    event1 = ResponseOutputItemAddedEvent(
+        type="response.output_item.added",
+        item=msg_item,
+        output_index=0,
+        sequence_number=0
+    )
 
-    assert len(events1) == 2
+    events1 = converter.convert_event(event1)
+    assert len(events1) == 1
     assert isinstance(events1[0], TextMessageStartEvent)
     assert events1[0].message_id == "msg_123"
-    assert isinstance(events1[1], TextMessageContentEvent)
-    assert events1[1].delta == "Hello"
 
-    # Chunk 2: Content " World"
-    chunk2 = create_chunk(delta_content=" World")
-    events2 = converter.convert_event(chunk2)
+    # 2. Text Delta "Hello"
+    event2 = ResponseTextDeltaEvent(
+        type="response.output_text.delta",
+        item_id="msg_123",
+        delta="Hello",
+        output_index=0,
+        content_index=0,
+        logprobs=[],
+        sequence_number=1
+    )
 
+    events2 = converter.convert_event(event2)
     assert len(events2) == 1
     assert isinstance(events2[0], TextMessageContentEvent)
-    assert events2[0].delta == " World"
+    assert events2[0].delta == "Hello"
 
-    # Chunk 3: Stop
-    chunk3 = create_chunk(delta_content=None, finish_reason="stop")
-    events3 = converter.convert_event(chunk3)
+    # 3. Text Done
+    event3 = ResponseTextDoneEvent(
+        type="response.output_text.done",
+        item_id="msg_123",
+        output_index=0,
+        content_index=0,
+        sequence_number=2,
+        text="Hello",
+        logprobs=[]
+    )
 
+    events3 = converter.convert_event(event3)
     assert len(events3) == 1
     assert isinstance(events3[0], TextMessageEndEvent)
     assert events3[0].message_id == "msg_123"
@@ -72,64 +82,54 @@ def test_convert_text_message():
 def test_convert_tool_call():
     converter = AGUIEventConverter()
 
-    # Chunk 1: Tool call start
-    tool_call_delta = ChoiceDeltaToolCall(
-        index=0,
-        id="call_abc",
-        function=ChoiceDeltaToolCallFunction(name="get_weather", arguments="")
+    # 1. Output Item Added (Function Call)
+    tool_item = ResponseFunctionToolCall(
+        id="item_tool_1",
+        call_id="call_abc123",
+        type="function_call",
+        name="get_weather",
+        arguments="",
+        status="in_progress"
     )
-    chunk1 = create_chunk(delta_tool_calls=[tool_call_delta])
-    events1 = converter.convert_event(chunk1)
+    event1 = ResponseOutputItemAddedEvent(
+        type="response.output_item.added",
+        item=tool_item,
+        output_index=0,
+        sequence_number=0
+    )
 
+    events1 = converter.convert_event(event1)
     assert len(events1) == 1
     assert isinstance(events1[0], ToolCallStartEvent)
-    assert events1[0].tool_call_id == "call_abc"
+    assert events1[0].tool_call_id == "call_abc123"
     assert events1[0].tool_call_name == "get_weather"
 
-    # Chunk 2: Tool call args "{"
-    tool_call_delta2 = ChoiceDeltaToolCall(
-        index=0,
-        function=ChoiceDeltaToolCallFunction(arguments="{")
+    # 2. Args Delta "{"
+    event2 = ResponseFunctionCallArgumentsDeltaEvent(
+        type="response.function_call_arguments.delta",
+        item_id="item_tool_1",
+        delta="{",
+        output_index=0,
+        sequence_number=1
     )
-    chunk2 = create_chunk(delta_tool_calls=[tool_call_delta2])
-    events2 = converter.convert_event(chunk2)
 
+    events2 = converter.convert_event(event2)
     assert len(events2) == 1
     assert isinstance(events2[0], ToolCallArgsEvent)
+    assert events2[0].tool_call_id == "call_abc123" # Should be mapped from item_id
     assert events2[0].delta == "{"
 
-    # Chunk 3: Tool call args "}"
-    tool_call_delta3 = ChoiceDeltaToolCall(
-        index=0,
-        function=ChoiceDeltaToolCallFunction(arguments="}")
+    # 3. Args Done
+    event3 = ResponseFunctionCallArgumentsDoneEvent(
+        type="response.function_call_arguments.done",
+        item_id="item_tool_1",
+        output_index=0,
+        sequence_number=2,
+        arguments="{}",
+        name="get_weather"
     )
-    chunk3 = create_chunk(delta_tool_calls=[tool_call_delta3])
-    events3 = converter.convert_event(chunk3)
 
+    events3 = converter.convert_event(event3)
     assert len(events3) == 1
-    assert isinstance(events3[0], ToolCallArgsEvent)
-    assert events3[0].delta == "}"
-
-    # Chunk 4: Finish tool calls
-    chunk4 = create_chunk(finish_reason="tool_calls")
-    events4 = converter.convert_event(chunk4)
-
-    assert len(events4) == 1
-    assert isinstance(events4[0], ToolCallEndEvent)
-    assert events4[0].tool_call_id == "call_abc"
-
-def test_mixed_text_and_stop():
-    converter = AGUIEventConverter()
-
-    # Chunk 1: content "Hi"
-    chunk1 = create_chunk(delta_content="Hi")
-    events1 = converter.convert_event(chunk1)
-
-    assert len(events1) == 2 # Start + Content
-
-    # Chunk 2: empty content, stop
-    chunk2 = create_chunk(delta_content="", finish_reason="stop")
-    events2 = converter.convert_event(chunk2)
-
-    assert len(events2) == 1
-    assert isinstance(events2[0], TextMessageEndEvent)
+    assert isinstance(events3[0], ToolCallEndEvent)
+    assert events3[0].tool_call_id == "call_abc123"
