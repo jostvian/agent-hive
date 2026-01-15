@@ -1,4 +1,5 @@
 import pytest
+from typing import AsyncIterable
 from app.tools.ag_ui_event_converter import AGUIEventConverter
 from ag_ui.core.events import (
     EventType,
@@ -9,25 +10,26 @@ from ag_ui.core.events import (
     ToolCallArgsEvent,
     ToolCallEndEvent,
 )
-# We need to mock the OpenAI events since constructing them might be verbose or require validation
 from openai.types.responses import (
     ResponseOutputItemAddedEvent,
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
     ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallArgumentsDoneEvent,
+    ResponseStreamEvent,
 )
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 
-# Mocking constructors or using simple objects since Pydantic models might require all fields
-# But since we have the libraries installed, we can try to use them if possible,
-# or use duck-typing/mock objects if constructors are too strict.
+async def async_iter(items: list) -> AsyncIterable:
+    for item in items:
+        yield item
 
-def test_convert_text_message():
+@pytest.mark.asyncio
+async def test_convert_text_message():
     converter = AGUIEventConverter()
 
-    # 1. Output Item Added (Message)
+    # Events
     msg_item = ResponseOutputMessage(
         id="msg_123",
         type="message",
@@ -42,12 +44,6 @@ def test_convert_text_message():
         sequence_number=0
     )
 
-    events1 = converter.convert_event(event1)
-    assert len(events1) == 1
-    assert isinstance(events1[0], TextMessageStartEvent)
-    assert events1[0].message_id == "msg_123"
-
-    # 2. Text Delta "Hello"
     event2 = ResponseTextDeltaEvent(
         type="response.output_text.delta",
         item_id="msg_123",
@@ -58,12 +54,6 @@ def test_convert_text_message():
         sequence_number=1
     )
 
-    events2 = converter.convert_event(event2)
-    assert len(events2) == 1
-    assert isinstance(events2[0], TextMessageContentEvent)
-    assert events2[0].delta == "Hello"
-
-    # 3. Text Done
     event3 = ResponseTextDoneEvent(
         type="response.output_text.done",
         item_id="msg_123",
@@ -74,15 +64,27 @@ def test_convert_text_message():
         logprobs=[]
     )
 
-    events3 = converter.convert_event(event3)
-    assert len(events3) == 1
-    assert isinstance(events3[0], TextMessageEndEvent)
-    assert events3[0].message_id == "msg_123"
+    stream = async_iter([event1, event2, event3])
 
-def test_convert_tool_call():
+    events = []
+    async for event in converter.convert_event(stream):
+        events.append(event)
+
+    assert len(events) == 3
+    assert isinstance(events[0], TextMessageStartEvent)
+    assert events[0].message_id == "msg_123"
+
+    assert isinstance(events[1], TextMessageContentEvent)
+    assert events[1].delta == "Hello"
+
+    assert isinstance(events[2], TextMessageEndEvent)
+    assert events[2].message_id == "msg_123"
+
+@pytest.mark.asyncio
+async def test_convert_tool_call():
     converter = AGUIEventConverter()
 
-    # 1. Output Item Added (Function Call)
+    # Events
     tool_item = ResponseFunctionToolCall(
         id="item_tool_1",
         call_id="call_abc123",
@@ -98,13 +100,6 @@ def test_convert_tool_call():
         sequence_number=0
     )
 
-    events1 = converter.convert_event(event1)
-    assert len(events1) == 1
-    assert isinstance(events1[0], ToolCallStartEvent)
-    assert events1[0].tool_call_id == "call_abc123"
-    assert events1[0].tool_call_name == "get_weather"
-
-    # 2. Args Delta "{"
     event2 = ResponseFunctionCallArgumentsDeltaEvent(
         type="response.function_call_arguments.delta",
         item_id="item_tool_1",
@@ -113,13 +108,6 @@ def test_convert_tool_call():
         sequence_number=1
     )
 
-    events2 = converter.convert_event(event2)
-    assert len(events2) == 1
-    assert isinstance(events2[0], ToolCallArgsEvent)
-    assert events2[0].tool_call_id == "call_abc123" # Should be mapped from item_id
-    assert events2[0].delta == "{"
-
-    # 3. Args Done
     event3 = ResponseFunctionCallArgumentsDoneEvent(
         type="response.function_call_arguments.done",
         item_id="item_tool_1",
@@ -129,7 +117,20 @@ def test_convert_tool_call():
         name="get_weather"
     )
 
-    events3 = converter.convert_event(event3)
-    assert len(events3) == 1
-    assert isinstance(events3[0], ToolCallEndEvent)
-    assert events3[0].tool_call_id == "call_abc123"
+    stream = async_iter([event1, event2, event3])
+
+    events = []
+    async for event in converter.convert_event(stream):
+        events.append(event)
+
+    assert len(events) == 3
+    assert isinstance(events[0], ToolCallStartEvent)
+    assert events[0].tool_call_id == "call_abc123"
+    assert events[0].tool_call_name == "get_weather"
+
+    assert isinstance(events[1], ToolCallArgsEvent)
+    assert events[1].tool_call_id == "call_abc123"
+    assert events[1].delta == "{"
+
+    assert isinstance(events[2], ToolCallEndEvent)
+    assert events[2].tool_call_id == "call_abc123"

@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Set, Any
+from typing import List, Optional, Dict, Set, Any, AsyncIterable
 from ag_ui.core.events import (
     BaseEvent,
     EventType,
@@ -27,33 +27,36 @@ class AGUIEventConverter:
         # Maps item_id (from OpenAI) to tool_call_id (for AG_UI/OpenAI correlation)
         self.item_id_to_tool_call_id: Dict[str, str] = {}
 
-    def convert_event(self, event: ResponseStreamEvent) -> List[BaseEvent]:
+    async def convert_event(self, stream: AsyncIterable[ResponseStreamEvent]) -> AsyncIterable[BaseEvent]:
         """
-        Converts an OpenAI ResponseStreamEvent into a list of AG_UI BaseEvents.
+        Converts a stream of OpenAI ResponseStreamEvents into a stream of AG_UI BaseEvents.
         """
-        events: List[BaseEvent] = []
+        async for event in stream:
+            # We collect events in a list internally for the single step, then yield them
+            events_to_yield: List[BaseEvent] = []
 
-        match event:
-            case ResponseOutputItemAddedEvent():
-                self._process_output_item_added(event, events)
+            match event:
+                case ResponseOutputItemAddedEvent():
+                    self._process_output_item_added(event, events_to_yield)
 
-            case ResponseTextDeltaEvent():
-                self._process_text_delta(event, events)
+                case ResponseTextDeltaEvent():
+                    self._process_text_delta(event, events_to_yield)
 
-            case ResponseTextDoneEvent():
-                self._process_text_done(event, events)
+                case ResponseTextDoneEvent():
+                    self._process_text_done(event, events_to_yield)
 
-            case ResponseFunctionCallArgumentsDeltaEvent():
-                self._process_function_call_delta(event, events)
+                case ResponseFunctionCallArgumentsDeltaEvent():
+                    self._process_function_call_delta(event, events_to_yield)
 
-            case ResponseFunctionCallArgumentsDoneEvent():
-                self._process_function_call_done(event, events)
+                case ResponseFunctionCallArgumentsDoneEvent():
+                    self._process_function_call_done(event, events_to_yield)
 
-            case _:
-                # Ignore other events
-                pass
+                case _:
+                    # Ignore other events
+                    pass
 
-        return events
+            for ag_ui_event in events_to_yield:
+                yield ag_ui_event
 
     def _process_output_item_added(self, event: ResponseOutputItemAddedEvent, events: List[BaseEvent]):
         """Handles new output items (messages or tool calls)."""
@@ -70,7 +73,6 @@ class AGUIEventConverter:
 
         elif item.type == "function_call":
             # Start of a function/tool call
-            # item.id is the item ID (used in deltas), item.call_id is the tool call ID
             tool_call_id = item.call_id
 
             # Store mapping for future deltas
@@ -117,5 +119,3 @@ class AGUIEventConverter:
                 type=EventType.TOOL_CALL_END,
                 tool_call_id=tool_call_id
             ))
-            # Optional: Clean up mapping if no longer needed
-            # del self.item_id_to_tool_call_id[event.item_id]
