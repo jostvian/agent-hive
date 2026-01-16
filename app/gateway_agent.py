@@ -1,4 +1,4 @@
-from app.microsoft_agent_framework_azure_ai.agent import AzureAIAgent
+from app.agents.agent import AzureAIAgent
 
 class GatewayAgent(AzureAIAgent):
     """

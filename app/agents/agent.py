@@ -1,7 +1,7 @@
 import os
 import uuid
 import asyncio
-import time
+from contextlib import AbstractAsyncContextManager
 from typing import AsyncIterable, List, Union, Optional
 
 from agent_framework import (
@@ -13,11 +13,11 @@ from agent_framework import (
     ChatMessageStore
 )
 
-from azure.ai.projects import AIProjectClient
+from azure.ai.projects.aio import AIProjectClient
 from azure.identity import DefaultAzureCredential
 from azure.ai.agents.models import MessageTextContent
 
-class AzureAIAgent:
+class AzureAIAgent(AbstractAsyncContextManager):
     def __init__(self) -> None:
         self._id: str = "azure-ai-gateway-agent"
         self._name: str = "Azure AI Gateway Agent"
@@ -34,6 +34,15 @@ class AzureAIAgent:
 
         self.agent_id: Optional[str] = os.environ.get("AZURE_AI_AGENT_ID")
         self._agent_obj = None
+
+    async def __aenter__(self):
+        if self.project_client:
+            await self.project_client.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        if self.project_client:
+            await self.project_client.__aexit__(exc_type, exc_value, traceback)
 
     @property
     def id(self) -> str:
@@ -57,16 +66,15 @@ class AzureAIAgent:
         if not self.project_client:
             raise ValueError("PROJECT_CONNECTION_STRING not set.")
 
-        def create_agent_sync():
-            # NOTE: Do not use 'with self.project_client' as it closes the client.
-            # We need a model. "gpt-4o" is a safe bet for Azure AI Foundry defaults
-            return self.project_client.agents.create_agent(
-                model="gpt-4o",
-                name="gateway-agent",
-                instructions="You are a helpful gateway agent."
-            )
+        # Create agent if needed
+        model_name = os.environ.get("AZURE_AI_MODEL", "gpt-4o")
 
-        agent = await asyncio.to_thread(create_agent_sync)
+        agent = await self.project_client.agents.create_agent(
+            model=model_name,
+            name="gateway-agent",
+            instructions="You are a helpful gateway agent."
+        )
+
         self._agent_obj = agent
         self.agent_id = agent.id
         return agent.id
@@ -82,10 +90,52 @@ class AzureAIAgent:
         **kwargs
     ) -> AgentRunResponse:
 
+        if not self.project_client:
+             raise ValueError("PROJECT_CONNECTION_STRING not set.")
+
         agent_id = await self._ensure_agent()
         user_message: str = self._extract_query(messages)
 
-        response_text = await asyncio.to_thread(self._run_sync, agent_id, user_message)
+        # Create a thread
+        thread_obj = await self.project_client.agents.create_thread()
+
+        await self.project_client.agents.create_message(
+            thread_id=thread_obj.id,
+            role="user",
+            content=user_message
+        )
+
+        run = await self.project_client.agents.create_run(
+            thread_id=thread_obj.id,
+            agent_id=agent_id
+        )
+
+        # Poll
+        while run.status in ["queued", "in_progress", "requires_action"]:
+            await asyncio.sleep(0.5)
+            run = await self.project_client.agents.get_run(thread_id=thread_obj.id, run_id=run.id)
+            if run.status == "failed":
+                response_text = "Error: Agent run failed."
+                break
+            if run.status == "cancelled":
+                response_text = "Error: Agent run cancelled."
+                break
+            if run.status == "requires_action":
+                response_text = "Error: Agent requires action (tool call) which is not supported yet."
+                break
+        else:
+            # Loop finished without break (completed)
+            messages_list = await self.project_client.agents.list_messages(thread_id=thread_obj.id)
+            # Messages are newest first
+            response_text = "No response from agent."
+            for msg in messages_list.data:
+                if msg.role == "assistant":
+                    text_parts = []
+                    for content in msg.content:
+                        if isinstance(content, MessageTextContent):
+                            text_parts.append(content.text.value)
+                    response_text = "\n".join(text_parts)
+                    break
 
         response_msg = ChatMessage(
             role="assistant",
@@ -93,47 +143,6 @@ class AzureAIAgent:
         )
 
         return AgentRunResponse(messages=[response_msg], response_id=str(uuid.uuid4()))
-
-    def _run_sync(self, agent_id: str, user_message: str) -> str:
-        if not self.project_client:
-             raise ValueError("PROJECT_CONNECTION_STRING not set.")
-
-        # Create a thread
-        thread_obj = self.project_client.agents.create_thread()
-
-        self.project_client.agents.create_message(
-            thread_id=thread_obj.id,
-            role="user",
-            content=user_message
-        )
-
-        run = self.project_client.agents.create_run(
-            thread_id=thread_obj.id,
-            agent_id=agent_id
-        )
-
-        # Poll
-        while run.status in ["queued", "in_progress", "requires_action"]:
-            time.sleep(0.5)
-            run = self.project_client.agents.get_run(thread_id=thread_obj.id, run_id=run.id)
-            if run.status == "failed":
-                return "Error: Agent run failed."
-            if run.status == "cancelled":
-                return "Error: Agent run cancelled."
-            if run.status == "requires_action":
-                # Break to avoid infinite loop
-                return "Error: Agent requires action (tool call) which is not supported yet."
-
-        messages = self.project_client.agents.list_messages(thread_id=thread_obj.id)
-        # Messages are newest first
-        for msg in messages.data:
-            if msg.role == "assistant":
-                text_parts = []
-                for content in msg.content:
-                    if isinstance(content, MessageTextContent):
-                        text_parts.append(content.text.value)
-                return "\n".join(text_parts)
-        return "No response from agent."
 
     async def run_stream(
         self,
@@ -143,7 +152,7 @@ class AzureAIAgent:
         **kwargs
     ) -> AsyncIterable[AgentRunResponseUpdate]:
 
-        # Streaming wrapper around buffered run
+        # Streaming wrapper around buffered run (simplified for this task)
         response = await self.run(messages, thread=thread, **kwargs)
         if hasattr(response, 'messages') and response.messages:
              for msg in response.messages:
